@@ -2,14 +2,25 @@ import asyncio
 import os
 import re
 import json
-import httpx  # Make sure to import httpx
 from typing import Union
-import yt_dlp
+
+from yt_dlp import YoutubeDL
 from pyrogram.enums import MessageEntityType
 from pyrogram.types import Message
 from youtubesearchpython.__future__ import VideosSearch
+
+import config
 from AnonXMusic.utils.database import is_on_off
 from AnonXMusic.utils.formatters import time_to_seconds
+
+
+def cookiefile():
+    cookie_dir = "cookies"
+    cookies_files = [f for f in os.listdir(cookie_dir) if f.endswith(".txt")]
+
+    return os.path.join(cookie_dir, cookies_files[0])
+
+
 async def shell_cmd(cmd):
     proc = await asyncio.create_subprocess_shell(
         cmd,
@@ -23,6 +34,8 @@ async def shell_cmd(cmd):
         else:
             return errorz.decode("utf-8")
     return out.decode("utf-8")
+
+
 class YouTubeAPI:
     def __init__(self):
         self.base = "https://www.youtube.com/watch?v="
@@ -30,13 +43,48 @@ class YouTubeAPI:
         self.status = "https://www.youtube.com/oembed?url="
         self.listbase = "https://youtube.com/playlist?list="
         self.reg = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+        # Allow overriding piped base via config.PIPED_BASE. Default to piped.video.
+        self.piped_base = getattr(config, "PIPED_BASE", "https://piped.video")
+
+    # ----- helper methods for piped -----
+    def _is_youtube_link(self, link: str) -> bool:
+        if not link:
+            return False
+        return bool(re.search(self.regex, link)) or len(link) == 11
+
+    def _extract_video_id(self, link: str) -> Union[str, None]:
+        # If it's already an 11-char id, return it
+        if link and len(link) == 11 and re.match(r"^[A-Za-z0-9_-]{11}$", link):
+            return link
+        # Try to parse typical youtube link forms
+        try:
+            if "v=" in link:
+                vidid = link.split("v=")[-1].split("&")[0]
+                if re.match(r"^[A-Za-z0-9_-]{11}$", vidid):
+                    return vidid
+            if "youtu.be/" in link:
+                vidid = link.split("youtu.be/")[-1].split("?")[0]
+                if re.match(r"^[A-Za-z0-9_-]{11}$", vidid):
+                    return vidid
+        except Exception:
+            return None
+        return None
+
+    def _piped_watch_url(self, link: str) -> Union[str, None]:
+        """
+        Return a piped.watch URL for the given youtube link/id, or None.
+        """
+        vidid = self._extract_video_id(link)
+        if vidid:
+            return f"{self.piped_base}/watch?v={vidid}"
+        return None
+
+    # ----- existing API methods (modified to try piped) -----
     async def exists(self, link: str, videoid: Union[bool, str] = None):
         if videoid:
             link = self.base + link
-        if re.search(self.regex, link):
-            return True
-        else:
-            return False
+        return bool(re.search(self.regex, link))
+
     async def url(self, message_1: Message) -> Union[str, None]:
         messages = [message_1]
         if message_1.reply_to_message:
@@ -57,9 +105,8 @@ class YouTubeAPI:
                 for entity in message.caption_entities:
                     if entity.type == MessageEntityType.TEXT_LINK:
                         return entity.url
-        if offset in (None,):
-            return None
-        return text[offset : offset + length]
+        return None if offset in (None,) else text[offset : offset + length]
+
     async def details(self, link: str, videoid: Union[bool, str] = None):
         if videoid:
             link = self.base + link
@@ -76,6 +123,7 @@ class YouTubeAPI:
             else:
                 duration_sec = int(time_to_seconds(duration_min))
         return title, duration_min, duration_sec, thumbnail, vidid
+
     async def title(self, link: str, videoid: Union[bool, str] = None):
         if videoid:
             link = self.base + link
@@ -85,6 +133,7 @@ class YouTubeAPI:
         for result in (await results.next())["result"]:
             title = result["title"]
         return title
+
     async def duration(self, link: str, videoid: Union[bool, str] = None):
         if videoid:
             link = self.base + link
@@ -94,6 +143,7 @@ class YouTubeAPI:
         for result in (await results.next())["result"]:
             duration = result["duration"]
         return duration
+
     async def thumbnail(self, link: str, videoid: Union[bool, str] = None):
         if videoid:
             link = self.base + link
@@ -103,41 +153,61 @@ class YouTubeAPI:
         for result in (await results.next())["result"]:
             thumbnail = result["thumbnails"][0]["url"].split("?")[0]
         return thumbnail
+
     async def video(self, link: str, videoid: Union[bool, str] = None):
+        """
+        Try piped first (if applicable), then fallback to original link.
+        Returns (1, url) on success (stdout first line), or (0, stderr) on failure.
+        """
         if videoid:
             link = self.base + link
         if "&" in link:
             link = link.split("&")[0]
-        proc = await asyncio.create_subprocess_exec(
-            "yt-dlp",
-            "-g",
-            "-f",
-            "best[height<=?720][width<=?1280]",
-            f"{link}",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-        if stdout:
-            return 1, stdout.decode().split("\n")[0]
-        else:
-            return 0, stderr.decode()
+
+        candidates = [link]
+        # if youtube-like link or id, try piped variant first
+        piped = self._piped_watch_url(link)
+        if piped:
+            candidates.insert(0, piped)
+
+        for candidate in candidates:
+            proc = await asyncio.create_subprocess_exec(
+                "yt-dlp",
+                "--cookies",
+                cookiefile(),
+                "-g",
+                "-f",
+                "best[height<=?720][width<=?1280]",
+                f"{candidate}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+            if stdout:
+                return (1, stdout.decode().split("\n")[0])
+            # if stderr mentions piped-specific issue, continue to next candidate
+            # else if last candidate, return stderr
+            # continue loop to try next candidate
+        # if none succeeded, return the last stderr
+        return (0, (stderr.decode() if stderr else "Unknown error"))
+
     async def playlist(self, link, limit, user_id, videoid: Union[bool, str] = None):
         if videoid:
             link = self.listbase + link
         if "&" in link:
             link = link.split("&")[0]
-        playlist = await shell_cmd(
-            f"yt-dlp -i --get-id --flat-playlist --playlist-end {limit} --skip-download {link}"
+        cmd = (
+            f"yt-dlp -i --compat-options no-youtube-unavailable-videos "
+            f"--get-id --flat-playlist --playlist-end {limit} --skip-download '{link}' "
+            f"2>/dev/null"
         )
+        playlist = await shell_cmd(cmd)
         try:
-            result = playlist.split("\n")
-            for key in result:
-                if key == "":
-                    result.remove(key)
-        except:
+            result = [key for key in playlist.split("\n") if key]
+        except Exception:
             result = []
         return result
+
     async def track(self, link: str, videoid: Union[bool, str] = None):
         if videoid:
             link = self.base + link
@@ -156,43 +226,62 @@ class YouTubeAPI:
             "vidid": vidid,
             "duration_min": duration_min,
             "thumb": thumbnail,
+            "cookiefile": cookiefile(),
         }
         return track_details, vidid
+
     async def formats(self, link: str, videoid: Union[bool, str] = None):
         if videoid:
             link = self.base + link
         if "&" in link:
             link = link.split("&")[0]
+
+        candidates = [link]
+        piped = self._piped_watch_url(link)
+        if piped:
+            candidates.insert(0, piped)
+
         ytdl_opts = {"quiet": True}
-        ydl = yt_dlp.YoutubeDL(ytdl_opts)
-        with ydl:
-            formats_available = []
-            r = ydl.extract_info(link, download=False)
-            for format in r["formats"]:
-                try:
-                    str(format["format"])
-                except:
-                    continue
-                if not "dash" in str(format["format"]).lower():
-                    try:
-                        format["format"]
-                        format["filesize"]
-                        format["format_id"]
-                        format["ext"]
-                        format["format_note"]
-                    except:
-                        continue
-                    formats_available.append(
-                        {
-                            "format": format["format"],
-                            "filesize": format["filesize"],
-                            "format_id": format["format_id"],
-                            "ext": format["ext"],
-                            "format_note": format["format_note"],
-                            "yturl": link,
-                        }
-                    )
-        return formats_available, link
+        for candidate in candidates:
+            try:
+                ydl = YoutubeDL(ytdl_opts)
+                with ydl:
+                    formats_available = []
+                    r = ydl.extract_info(candidate, download=False)
+                    for fmt in r.get("formats", []):
+                        try:
+                            str(fmt["format"])
+                        except Exception:
+                            continue
+                        if "dash" not in str(fmt["format"]).lower():
+                            try:
+                                fmt["format"]
+                                fmt.get("filesize")
+                                fmt["format_id"]
+                                fmt["ext"]
+                                fmt.get("format_note", "")
+                            except Exception:
+                                continue
+                            formats_available.append(
+                                {
+                                    "format": fmt["format"],
+                                    "filesize": fmt.get("filesize"),
+                                    "format_id": fmt["format_id"],
+                                    "ext": fmt["ext"],
+                                    "format_note": fmt.get("format_note", ""),
+                                    "yturl": candidate,
+                                    "cookiefile": cookiefile(),
+                                }
+                            )
+                    # If formats found, return them
+                    if formats_available:
+                        return formats_available, link
+            except Exception:
+                # try next candidate
+                continue
+        # if all candidates fail, raise or return empty
+        return [], link
+
     async def slider(
         self,
         link: str,
@@ -210,21 +299,7 @@ class YouTubeAPI:
         vidid = result[query_type]["id"]
         thumbnail = result[query_type]["thumbnails"][0]["url"].split("?")[0]
         return title, duration_min, thumbnail, vidid
-    async def get_video_info_from_bitflow(self, url: str, video: bool):
-        api_url = "https://bitflow.in/api/youtube"
-        params = {
-            "query": url,
-            "format": "video" if video else "audio",
-            "download": True,
-            "api_key": "youtube321bot"
-        }
-        
-        async with httpx.AsyncClient() as client:
-            response = await client.get(api_url, params=params, timeout=150)
-            if response.status_code == 200:
-                return response.json()
-            else:
-                return {"status": "error", "message": "Failed to fetch data from Bitflow API."}
+
     async def download(
         self,
         link: str,
@@ -236,43 +311,61 @@ class YouTubeAPI:
         format_id: Union[bool, str] = None,
         title: Union[bool, str] = None,
     ) -> str:
+        """
+        Attempts download using piped first (when applicable) then falls back to original link.
+        Returns (downloaded_file, direct) or path string depending on the flags (preserves previous API).
+        """
         if videoid:
             link = self.base + link
         if "&" in link:
             link = link.split("&")[0]
+
+        # Build candidate list: try piped first if possible
+        candidates = [link]
+        piped = self._piped_watch_url(link)
+        if piped:
+            candidates.insert(0, piped)
+
         loop = asyncio.get_running_loop()
-        bitflow_info = await self.get_video_info_from_bitflow(link, video)
-        def audio_dl(bitflow_info):
-            xyz = os.path.join("downloads", f"{bitflow_info['videoid']}.{bitflow_info['ext']}")
+
+        # create parameterized download functions so we can pass different candidate links
+        def _audio_dl_candidate(cand_link):
             ydl_optssx = {
-                "format": "bestaudio/best",
-                "outtmpl": xyz,
+                "cookiefile": cookiefile(),
+                "format": "bestaudio[ext=m4a]/bestaudio/best",
+                "outtmpl": "downloads/%(id)s.%(ext)s",
                 "geo_bypass": True,
                 "nocheckcertificate": True,
                 "quiet": True,
                 "no_warnings": True,
             }
-            x = yt_dlp.YoutubeDL(ydl_optssx) 
-            if os.path.exists(xyz):
+            with YoutubeDL(ydl_optssx) as x:
+                info = x.extract_info(cand_link, False)
+                xyz = os.path.join("downloads", f"{info['id']}.{info['ext']}")
+                if os.path.exists(xyz):
+                    return xyz
+                x.download([cand_link])
                 return xyz
-            x.download([bitflow_info['url']])
-            return xyz
-        def video_dl(bitflow_info):
-            xyz = os.path.join("downloads", f"{bitflow_info['videoid']}.{bitflow_info['ext']}")
+
+        def _video_dl_candidate(cand_link):
             ydl_optssx = {
-                "format": "(bestvideo[height<=?720][width<=?1280][ext=mp4])+(bestaudio[ext=m4a])",
-                "outtmpl": xyz,
+                "cookiefile": cookiefile(),
+                "format": "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4][height<=1080]",
+                "outtmpl": "downloads/%(id)s.%(ext)s",
                 "geo_bypass": True,
                 "nocheckcertificate": True,
                 "quiet": True,
                 "no_warnings": True,
             }
-            x = yt_dlp.YoutubeDL(ydl_optssx)
-            if os.path.exists(xyz):
+            with YoutubeDL(ydl_optssx) as x:
+                info = x.extract_info(cand_link, False)
+                xyz = os.path.join("downloads", f"{info['id']}.{info['ext']}")
+                if os.path.exists(xyz):
+                    return xyz
+                x.download([cand_link])
                 return xyz
-            x.download([bitflow_info['url']])
-            return xyz
-        def song_video_dl():
+
+        def _song_video_dl_candidate(cand_link):
             formats = f"{format_id}+140"
             fpath = f"downloads/{title}"
             ydl_optssx = {
@@ -282,12 +375,14 @@ class YouTubeAPI:
                 "nocheckcertificate": True,
                 "quiet": True,
                 "no_warnings": True,
+                "cookiefile": cookiefile(),
                 "prefer_ffmpeg": True,
                 "merge_output_format": "mp4",
             }
-            x = yt_dlp.YoutubeDL(ydl_optssx)
-            x.download([link])
-        def song_audio_dl():
+            x = YoutubeDL(ydl_optssx)
+            x.download([cand_link])
+
+        def _song_audio_dl_candidate(cand_link):
             fpath = f"downloads/{title}.%(ext)s"
             ydl_optssx = {
                 "format": format_id,
@@ -296,6 +391,7 @@ class YouTubeAPI:
                 "nocheckcertificate": True,
                 "quiet": True,
                 "no_warnings": True,
+                "cookiefile": cookiefile(),
                 "prefer_ffmpeg": True,
                 "postprocessors": [
                     {
@@ -305,21 +401,81 @@ class YouTubeAPI:
                     }
                 ],
             }
-            x = yt_dlp.YoutubeDL(ydl_optssx)
-            x.download([link])
+            x = YoutubeDL(ydl_optssx)
+            x.download([cand_link])
+
+        # If songvideo or songaudio we don't need candidate swapping logic beyond trying piped then original
         if songvideo:
-            await loop.run_in_executor(None, song_video_dl)
-            fpath = f"downloads/{title}.mp4"
-            return fpath
-        elif songaudio:
-            await loop.run_in_executor(None, song_audio_dl)
-            fpath = f"downloads/{title}.mp3"
-            return fpath
-        elif video:
-            direct = True
-            downloaded_file = await loop.run_in_executor(None, video_dl, bitflow_info)
-        else:
-            direct = True
-            downloaded_file = await loop.run_in_executor(None, audio_dl, bitflow_info)
-        return downloaded_file, direct  
-        
+            last_exc = None
+            for cand in candidates:
+                try:
+                    await loop.run_in_executor(None, _song_video_dl_candidate, cand)
+                    fpath = f"downloads/{title}.mp4"
+                    return fpath
+                except Exception as e:
+                    last_exc = e
+                    continue
+            # If we reach here, all failed
+            raise last_exc or Exception("song video download failed")
+
+        if songaudio:
+            last_exc = None
+            for cand in candidates:
+                try:
+                    await loop.run_in_executor(None, _song_audio_dl_candidate, cand)
+                    fpath = f"downloads/{title}.mp3"
+                    return fpath
+                except Exception as e:
+                    last_exc = e
+                    continue
+            raise last_exc or Exception("song audio download failed")
+
+        if video:
+            # If is_on_off(1) True -> use download path for video
+            if await is_on_off(1):
+                # attempt to download using candidates
+                last_exc = None
+                for cand in candidates:
+                    try:
+                        downloaded_file = await loop.run_in_executor(None, _video_dl_candidate, cand)
+                        return downloaded_file, True
+                    except Exception as e:
+                        last_exc = e
+                        continue
+                # all failed
+                raise last_exc or Exception("video download failed")
+            else:
+                # try to get direct URL via yt-dlp -g (piped first)
+                for cand in candidates:
+                    proc = await asyncio.create_subprocess_exec(
+                        "yt-dlp",
+                        "--cookies",
+                        cookiefile(),
+                        "-g",
+                        "-f",
+                        "best[height<=?720][width<=?1280]",
+                        f"{cand}",
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    stdout, stderr = await proc.communicate()
+                    if stdout:
+                        downloaded_file = stdout.decode().split("\n")[0]
+                        direct = None
+                        return downloaded_file, direct
+                    # else try next candidate
+                # if none returned stdout, return None
+                return
+
+        # default: audio download
+        last_exc = None
+        for cand in candidates:
+            try:
+                downloaded_file = await loop.run_in_executor(None, _audio_dl_candidate, cand)
+                direct = True
+                return downloaded_file, direct
+            except Exception as e:
+                last_exc = e
+                continue
+        # if none succeeded
+        raise last_exc or Exception("audio download failed")
